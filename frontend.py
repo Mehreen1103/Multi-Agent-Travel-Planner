@@ -1,8 +1,17 @@
 import os
+import logging
 import streamlit as st
 from datetime import datetime
 from langchain_core.messages import HumanMessage
 from main import app, stateless_app
+from guardrails import (
+    validate_query,
+    validate_user_id,
+    has_budget,
+    MAX_FOLLOWUP_CHARS,
+)
+
+logger = logging.getLogger("travel_console")
 
 st.set_page_config(
     page_title="Travel Planning Console",
@@ -201,6 +210,21 @@ if "query_text" not in st.session_state:
     st.session_state.query_text = ""
 if "result" not in st.session_state:
     st.session_state.result = None
+if "refinement_messages" not in st.session_state:
+    st.session_state.refinement_messages = []
+if st.session_state.result and not st.session_state.refinement_messages:
+    st.session_state.refinement_messages.append(
+        {
+            "role": "user",
+            "content": st.session_state.result["query"],
+        }
+    )
+    st.session_state.refinement_messages.append(
+        {
+            "role": "assistant",
+            "content": st.session_state.result["collected"]["final_response"],
+        }
+    )
 
 
 def set_template(text: str):
@@ -222,6 +246,118 @@ def render_tracker(states: dict) -> str:
     return html + "</div>"
 
 
+def run_plan(
+    query: str,
+    user_id: str,
+    original_query: str = "",
+    follow_up: str = "",
+    previous_plan: str = "",
+):
+    """Run the agent pipeline and store the result in session state.
+
+    Returns None on success, or a user-safe error message on failure.
+    """
+    runner = app if user_id else stateless_app
+    config = {"configurable": {"thread_id": user_id}} if user_id else {}
+    collected = {"flight_results": "", "hotel_results": "",
+                 "itinerary": "", "final_response": "", "llm_calls": 0}
+
+    st.markdown("<div class='section-title'>Processing</div>", unsafe_allow_html=True)
+    tracker_slot = st.empty()
+    states = {key: "pending" for key, _ in PIPELINE}
+    states[PIPELINE[0][0]] = "active"
+    tracker_slot.markdown(render_tracker(states), unsafe_allow_html=True)
+
+    try:
+        with st.spinner("Agents are working on your request..."):
+            for chunk in runner.stream(
+                {
+                    "messages": [HumanMessage(content=query)],
+                    "user_query": query,
+                    "original_query": original_query or query,
+                    "follow_up": follow_up,
+                    "previous_plan": previous_plan,
+                    "flight_results": "",
+                    "hotel_results": "",
+                    "itinerary": "",
+                    "llm_calls": 0,
+                },
+                config=config,
+                stream_mode="updates",
+            ):
+                for node_name, state_update in chunk.items():
+                    if node_name == "flight_agent":
+                        collected["flight_results"] = state_update.get("flight_results", "")
+                    elif node_name == "hotel_agent":
+                        collected["hotel_results"] = state_update.get("hotel_results", "")
+                    elif node_name == "itinerary_agent":
+                        collected["itinerary"] = state_update.get("itinerary", "")
+                    elif node_name == "final_agent":
+                        msgs = state_update.get("messages", [])
+                        collected["final_response"] = msgs[-1].content if msgs else ""
+
+                    collected["llm_calls"] = state_update.get("llm_calls", collected["llm_calls"])
+
+                    if node_name in states:
+                        states[node_name] = "done"
+                        keys = [k for k, _ in PIPELINE]
+                        idx = keys.index(node_name)
+                        if idx + 1 < len(keys):
+                            states[keys[idx + 1]] = "active"
+                        tracker_slot.markdown(render_tracker(states), unsafe_allow_html=True)
+    except Exception:
+        # Full details go to the server log only; never show raw errors in the UI
+        logger.exception("Plan generation failed")
+        return "The request could not be completed. Please try again."
+
+    now = datetime.now()
+    filename = f"travel_plan_{now.strftime('%Y%m%d_%H%M%S_%f')}.md"
+    file_content = f"""# Travel Plan
+**Query:** {query}
+**Generated:** {now.strftime("%Y-%m-%d %H:%M:%S")}
+**User ID:** {user_id or 'Not provided (history not saved)'}
+
+---
+
+## Flight Information
+{collected['flight_results'] or 'N/A'}
+
+---
+
+## Accommodation
+{collected['hotel_results'] or 'N/A'}
+
+---
+
+## Itinerary
+{collected['itinerary'] or 'N/A'}
+
+---
+
+## Final Travel Plan
+{collected['final_response'] or 'N/A'}
+
+---
+*LLM Calls: {collected['llm_calls']}*
+"""
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "travel_plans")
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, filename), "w", encoding="utf-8") as f:
+        f.write(file_content)
+
+    # Persist so results survive reruns (e.g. clicking Download)
+    st.session_state.result = {
+        "collected": collected,
+        "query": query,
+        "original_query": original_query or query,
+        "user": user_id,
+        "generated": now.strftime("%d %b %Y, %H:%M"),
+        "filename": filename,
+        "file_content": file_content,
+    }
+    return None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Sidebar
 # ══════════════════════════════════════════════════════════════════════════════
@@ -233,6 +369,7 @@ with st.sidebar:
     thread_id = st.text_input(
         "User ID (optional)",
         value="",
+        max_chars=64,
         help="Leave blank for a one-off request. Enter the same ID again to save and resume that user's conversation history.",
     )
     if thread_id.strip():
@@ -250,7 +387,7 @@ with st.sidebar:
     st.markdown("<div class='side-heading'>Platform</div>", unsafe_allow_html=True)
     for name, role in [
         ("LangGraph", "Orchestration"),
-        ("Groq · LLaMA 3.3 70B", "Language model"),
+        ("Groq · GPT-OSS 120B", "Language model"),
         ("PostgreSQL", "Persistence"),
         ("Tavily", "Web search"),
         ("AviationStack", "Flight data"),
@@ -291,115 +428,33 @@ with st.container(border=True):
         key="query_text",
         placeholder="Example: Plan a complete 7-day Japan trip including flights, hotels and sightseeing under ₹2 lakhs",
         height=110,
+        max_chars=1000,
     )
 
     generate = st.button("Generate travel plan", type="primary", use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Pipeline execution
+# Pipeline execution (new request)
 # ══════════════════════════════════════════════════════════════════════════════
 if generate:
-    if not user_query.strip():
-        st.warning("Enter a trip description before generating a plan.")
+    ok_id, user_id = validate_user_id(thread_id)
+    ok_q, cleaned = validate_query(user_query)
+    if not ok_id:
+        st.warning(user_id)
+    elif not ok_q:
+        st.warning(cleaned)
     else:
-        user_id = thread_id.strip()
-        runner = app if user_id else stateless_app
-        config = {"configurable": {"thread_id": user_id}} if user_id else {}
-        collected = {"flight_results": "", "hotel_results": "",
-                     "itinerary": "", "final_response": "", "llm_calls": 0}
-
-        st.markdown("<div class='section-title'>Processing</div>", unsafe_allow_html=True)
-        tracker_slot = st.empty()
-        states = {key: "pending" for key, _ in PIPELINE}
-        states[PIPELINE[0][0]] = "active"
-        tracker_slot.markdown(render_tracker(states), unsafe_allow_html=True)
-
-        error = None
-        try:
-            with st.spinner("Agents are working on your request..."):
-                for chunk in runner.stream(
-                    {
-                        "messages": [HumanMessage(content=user_query)],
-                        "user_query": user_query,
-                        "flight_results": "",
-                        "hotel_results": "",
-                        "itinerary": "",
-                        "llm_calls": 0,
-                    },
-                    config=config,
-                    stream_mode="updates",
-                ):
-                    for node_name, state_update in chunk.items():
-                        if node_name == "flight_agent":
-                            collected["flight_results"] = state_update.get("flight_results", "")
-                        elif node_name == "hotel_agent":
-                            collected["hotel_results"] = state_update.get("hotel_results", "")
-                        elif node_name == "itinerary_agent":
-                            collected["itinerary"] = state_update.get("itinerary", "")
-                        elif node_name == "final_agent":
-                            msgs = state_update.get("messages", [])
-                            collected["final_response"] = msgs[-1].content if msgs else ""
-
-                        collected["llm_calls"] = state_update.get("llm_calls", collected["llm_calls"])
-
-                        # Update tracker
-                        if node_name in states:
-                            states[node_name] = "done"
-                            keys = [k for k, _ in PIPELINE]
-                            idx = keys.index(node_name)
-                            if idx + 1 < len(keys):
-                                states[keys[idx + 1]] = "active"
-                            tracker_slot.markdown(render_tracker(states), unsafe_allow_html=True)
-        except Exception as exc:  # surface failures clearly instead of a raw traceback
-            error = exc
-
-        if error:
-            st.error(f"The request could not be completed: {error}")
+        err = run_plan(cleaned, user_id)
+        if err:
+            st.error(err)
         else:
-            now = datetime.now()
-            filename = f"travel_plan_{now.strftime('%Y%m%d_%H%M%S')}.md"
-            file_content = f"""# Travel Plan
-**Query:** {user_query}
-**Generated:** {now.strftime("%Y-%m-%d %H:%M:%S")}
-**User ID:** {user_id or 'Not provided (history not saved)'}
-
----
-
-## Flight Information
-{collected['flight_results'] or 'N/A'}
-
----
-
-## Accommodation
-{collected['hotel_results'] or 'N/A'}
-
----
-
-## Itinerary
-{collected['itinerary'] or 'N/A'}
-
----
-
-## Final Travel Plan
-{collected['final_response'] or 'N/A'}
-
----
-*LLM Calls: {collected['llm_calls']}*
-"""
-            save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "travel_plans")
-            os.makedirs(save_dir, exist_ok=True)
-            with open(os.path.join(save_dir, filename), "w", encoding="utf-8") as f:
-                f.write(file_content)
-
-            # Persist so results survive reruns (e.g. clicking Download)
-            st.session_state.result = {
-                "collected": collected,
-                "query": user_query,
-                "user": user_id,
-                "generated": now.strftime("%d %b %Y, %H:%M"),
-                "filename": filename,
-                "file_content": file_content,
-            }
+            st.session_state.refinement_messages = [
+                {"role": "user", "content": cleaned},
+                {
+                    "role": "assistant",
+                    "content": st.session_state.result["collected"]["final_response"],
+                }
+            ]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Results
@@ -420,6 +475,10 @@ if res:
     """, unsafe_allow_html=True)
 
     st.caption(f"Request: {res['query']}")
+
+    if not has_budget(res["query"]):
+        st.info("No budget was provided, so this plan is not budget-constrained. "
+                "Add your budget in the follow-up box below to get a tailored plan.")
 
     tab_plan, tab_flights, tab_hotels, tab_itin = st.tabs(
         ["Final plan", "Flights", "Accommodation", "Itinerary"]
@@ -452,3 +511,48 @@ if res:
             f"<div class='save-note'>Saved to <code>travel_plans/{res['filename']}</code></div>",
             unsafe_allow_html=True,
         )
+
+    # ── Follow-up: refine the plan (e.g. add a budget) ───────────────────────
+    st.markdown("<div class='section-title'>Continue planning</div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        with st.form("refine_form"):
+            followup = st.text_input(
+                "Your message",
+                key="followup_text",
+                max_chars=MAX_FOLLOWUP_CHARS,
+                placeholder="Example: My budget is ₹1.5 lakh; update the plan to fit it",
+            )
+            refine = st.form_submit_button("Send", use_container_width=True)
+
+    if refine:
+        ok_f, cleaned_f = validate_query(followup, MAX_FOLLOWUP_CHARS, require_travel=False)
+        if not ok_f:
+            st.warning(cleaned_f)
+        else:
+            # The graph starts fresh on each run, so carry the original request along
+            original_query = res.get("original_query", res["query"])
+            combined = f"{original_query}\nFollow-up from user: {cleaned_f}"
+            err = run_plan(
+                combined,
+                res["user"],
+                original_query=original_query,
+                follow_up=cleaned_f,
+                previous_plan=res["collected"]["final_response"],
+            )
+            if err:
+                st.error(err)
+            else:
+                st.session_state.refinement_messages.extend(
+                    [
+                        {"role": "user", "content": cleaned_f},
+                        {
+                            "role": "assistant",
+                            "content": st.session_state.result["collected"]["final_response"],
+                        },
+                    ]
+                )
+                st.rerun()
+
+    for message in st.session_state.refinement_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"] or "_No response was generated._")
