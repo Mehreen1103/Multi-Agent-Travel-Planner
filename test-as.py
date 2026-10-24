@@ -1,4 +1,5 @@
 import os
+import sys
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 import asyncio
@@ -19,12 +20,10 @@ client = MultiServerMCPClient(
     {
         "aviationstack": {
             "transport": "stdio",
-            "command": r"C:\Users\Dynamic_Computer\Desktop\multi-agent-with-mcp\aviationstack-mcp\.venv\Scripts\python.exe",
+            "command": sys.executable,
             "args": [
                 "-m",
-                "aviationstack_mcp",
-                "mcp",
-                "run"
+                "aviationstack_mcp"
             ],
             "env": server_env  # This will only pass valid strings or be empty
         }

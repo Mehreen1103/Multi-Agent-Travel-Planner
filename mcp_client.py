@@ -1,5 +1,7 @@
 import os
 import asyncio
+import sys
+from pathlib import Path
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from dotenv import load_dotenv
@@ -21,12 +23,10 @@ client = MultiServerMCPClient(
 
         "aviationstack": {
             "transport": "stdio",
-            "command": r"C:\Users\Dynamic_Computer\Desktop\multi-agent-with-mcp\aviationstack-mcp\.venv\Scripts\python.exe",
+            "command": sys.executable,
             "args": [
                 "-m",
-                "aviationstack_mcp",
-                "mcp",
-                "run"
+                "aviationstack_mcp"
             ],
             "env": {
                 "AVIATION_STACK_API_KEY": AVIATION_STACK_API_KEY
@@ -35,9 +35,9 @@ client = MultiServerMCPClient(
 
         "weather": {
             "transport": "stdio",
-            "command": r"C:\Users\Dynamic_Computer\Desktop\multi-agent-with-mcp\mcp-travel\Scripts\python.exe",
+            "command": sys.executable,
             "args": [
-                r"C:\Users\Dynamic_Computer\Desktop\multi-agent-with-mcp\custom-mcp-server.py"
+                str(Path(__file__).with_name("custom-mcp-server.py"))
             ],
             "env": {
                 "OPENWEATHER_API_KEY": OPENWEATHER_API_KEY
